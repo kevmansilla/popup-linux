@@ -3,12 +3,10 @@ import pyperclip
 import subprocess
 import threading
 import time
+import webbrowser
 
 
 def get_selected_text():
-    '''
-    retorna el texto seleccionado en el portapapeles
-    '''
     try:
         selected_text = subprocess.check_output(
             ['xclip', '-o', '-selection', 'primary']).decode('utf-8')
@@ -18,25 +16,43 @@ def get_selected_text():
 
 
 class PopupWindow(tk.Toplevel):
-    '''
-    Clase del Popup
-    '''
-
     def __init__(self, selected_text):
         super().__init__()
-        self.geometry('1000x1000')
+        self.geometry('900x600')
         self.title('Opciones')
 
-        label = tk.Label(self, text='Texto seleccionado: ' + selected_text)
+        # Etiqueta descriptiva
+        label = tk.Label(self, text='Texto seleccionado:')
         label.pack()
 
+        # Cuadro de texto para mostrar el texto seleccionado
+        text_box = tk.Text(self, height=10, width=90)
+        text_box.insert(tk.END, selected_text)
+        text_box.pack()
+
+        # Botón de copiar
         button_copy = tk.Button(
             self, text='Copiar',
             command=lambda: self.copy_to_clipboard(selected_text))
         button_copy.pack()
 
+        # boton para buscar en google
+        button_search_google = tk.Button(
+            self, text='Buscar en Google',
+            command=lambda: webbrowser.open(
+                'https://www.google.com/search?q=' + selected_text))
+        button_search_google.pack()
+
+        # boton para traducir
+        button_translate = tk.Button(
+            self, text='Traducir',
+            command=lambda: webbrowser.open(
+                'https://translate.google.com/?sl=auto&tl=es&text=' + selected_text))
+        button_translate.pack()
+
         self.protocol('WM_DELETE_WINDOW', self.close_popup)
         self.bind('<FocusOut>', self.close_popup)
+        self.bind('<Escape>', self.close_popup)
 
     def close_popup(self, event=None):
         self.destroy()
@@ -47,9 +63,6 @@ class PopupWindow(tk.Toplevel):
 
 
 def check_clipboard():
-    '''
-    Funcion que se ejecuta en un hilo para revisar el portapapeles
-    '''
     previous_text = get_selected_text()
     current_popup = None
 
