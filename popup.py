@@ -31,7 +31,8 @@ class PopupWindow(tk.Toplevel):
         label.pack()
 
         button_copy = tk.Button(
-            self, text='Copiar', command=lambda: self.copy_to_clipboard(selected_text))
+            self, text='Copiar',
+            command=lambda: self.copy_to_clipboard(selected_text))
         button_copy.pack()
 
         self.protocol('WM_DELETE_WINDOW', self.close_popup)
