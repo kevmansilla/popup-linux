@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Popup Linux
+Comment=Popup de acciones al seleccionar texto
+Exec=/home/kevin/popup-linux/popup-linux.sh
+Icon=/home/kevin/popup-linux/popup-linux.png
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupNotify=false

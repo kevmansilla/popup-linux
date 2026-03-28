@@ -6,10 +6,16 @@ import subprocess
 import shutil
 import re
 import time
+import glob
+import threading
 import webbrowser
 from urllib.parse import quote_plus
 
-import pystray
+import evdev
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
 from PIL import Image, ImageDraw
 
 
@@ -208,12 +214,124 @@ class PopupBar:
                         + quote_plus(self.selected_text))
 
 
-# --- App principal (polling adaptativo) ---
+# --- Detección de mouse vía evdev ---
 
-FAST_POLL = 800       # cuando se detectó cambio reciente
-SLOW_POLL = 5000      # estado normal (no interfiere con click derecho)
-HIDE_AFTER = 3.5      # segundos antes de ocultar popup
-COOLDOWN = 3000       # pausa después de ocultar popup
+BTN_LEFT = 272
+BTN_RIGHT = 273
+CHECK_DELAY = 200     # ms después de soltar botón izquierdo
+HIDE_AFTER = 3500     # ms antes de ocultar popup
+
+
+def find_mouse_devices():
+    """Encuentra todos los dispositivos con BTN_LEFT."""
+    devices = []
+    for path in sorted(glob.glob('/dev/input/event*')):
+        try:
+            dev = evdev.InputDevice(path)
+            caps = dev.capabilities()
+            if 1 in caps and BTN_LEFT in caps[1]:
+                devices.append(dev)
+            else:
+                dev.close()
+        except (PermissionError, OSError):
+            pass
+    return devices
+
+
+# --- Tray icon vía KDE StatusNotifierItem (DBus) ---
+
+class TrayIcon(dbus.service.Object):
+    IFACE = 'org.kde.StatusNotifierItem'
+    BUS_NAME = 'org.kde.StatusNotifierItem-popup-%d' % os.getpid()
+
+    def __init__(self, icon_path, app):
+        self.app = app
+        self._bus = dbus.SessionBus()
+        bus_name = dbus.service.BusName(self.BUS_NAME, self._bus,
+                                        allow_replacement=True,
+                                        replace_existing=True)
+        super().__init__(bus_name, '/StatusNotifierItem')
+
+        img = Image.open(icon_path).convert('RGBA').resize((48, 48))
+        self._icon_pixmap = self._to_pixmap(img)
+        self._empty_pixmap = dbus.Array([], signature='(iiay)')
+        self._empty_tooltip = dbus.Struct(
+            ('', self._empty_pixmap, 'Popup Linux', 'Click para cerrar'),
+            signature=None)
+
+        watcher = self._bus.get_object('org.kde.StatusNotifierWatcher',
+                                       '/StatusNotifierWatcher')
+        watcher.RegisterStatusNotifierItem(
+            self.BUS_NAME,
+            dbus_interface='org.kde.StatusNotifierWatcher')
+
+    def _to_pixmap(self, img):
+        w, h = img.size
+        px = []
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = img.getpixel((x, y))
+                px += [dbus.Byte(a), dbus.Byte(r), dbus.Byte(g), dbus.Byte(b)]
+        return dbus.Array([
+            dbus.Struct((dbus.Int32(w), dbus.Int32(h),
+                         dbus.Array(px, signature='y')), signature=None)
+        ], signature='(iiay)')
+
+    @dbus.service.method(IFACE, in_signature='ii')
+    def Activate(self, x, y):
+        self.app._quit()
+
+    @dbus.service.method(IFACE, in_signature='ii')
+    def SecondaryActivate(self, x, y):
+        self.app._quit()
+
+    @dbus.service.method(IFACE, in_signature='ii')
+    def ContextMenu(self, x, y):
+        self.app._quit()
+
+    @dbus.service.method(IFACE, in_signature='is')
+    def Scroll(self, delta, orientation):
+        pass
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='ss', out_signature='v')
+    def Get(self, interface, prop):
+        props = self._props()
+        if prop in props:
+            return props[prop]
+        raise dbus.exceptions.DBusException(
+            'org.freedesktop.DBus.Error.UnknownProperty',
+            'Unknown property: %s' % prop)
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        return self._props()
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='ssv')
+    def Set(self, interface, prop, value):
+        pass
+
+    def _props(self):
+        return {
+            'Category': 'ApplicationStatus',
+            'Id': 'popup-linux',
+            'Title': 'Popup Linux',
+            'Status': 'Active',
+            'WindowId': dbus.Int32(0),
+            'IconName': '',
+            'IconPixmap': self._icon_pixmap,
+            'OverlayIconName': '',
+            'OverlayIconPixmap': self._empty_pixmap,
+            'AttentionIconName': '',
+            'AttentionIconPixmap': self._empty_pixmap,
+            'AttentionMovieName': '',
+            'ToolTip': self._empty_tooltip,
+            'Menu': dbus.ObjectPath('/NO_DBUSMENU'),
+            'ItemIsMenu': dbus.Boolean(False),
+            'IconThemePath': '',
+        }
+
+
+# --- App principal (event-driven) ---
 
 class App:
     def __init__(self):
@@ -222,66 +340,91 @@ class App:
         self.popup = PopupBar(self.root)
         self.paused = False
         self.previous_text = get_selected_text()
-        self._show_time = 0
-        self._no_change_count = 0
-        self._schedule_poll(SLOW_POLL)
+        self._hide_timer = None
+        self._left_press_time = 0
+        self._check_pending = False
+        self._start_mouse_thread()
         self._start_tray()
 
-    def _schedule_poll(self, interval):
-        self.root.after(interval, self._check_clipboard)
-
-    def _check_clipboard(self):
-        # Auto-hide
-        if self.popup.visible:
-            if time.time() - self._show_time > HIDE_AFTER:
-                self.popup.hide()
-                # Cooldown: no leer wl-paste por un rato
-                self._schedule_poll(COOLDOWN)
-                return
-            # Popup visible: no leer wl-paste, solo esperar
-            self._schedule_poll(500)
+    def _start_mouse_thread(self):
+        devices = find_mouse_devices()
+        if not devices:
+            print('Aviso: no se encontraron dispositivos de mouse, usando polling')
+            self._fallback_polling()
             return
+        # Usar solo el primer dispositivo de mouse para evitar duplicados
+        dev = devices[0]
+        for d in devices[1:]:
+            d.close()
+        t = threading.Thread(target=self._mouse_loop, args=(dev,), daemon=True)
+        t.start()
 
-        if self.paused:
-            self._schedule_poll(SLOW_POLL)
+    def _mouse_loop(self, dev):
+        try:
+            for event in dev.read_loop():
+                if event.type == 1:  # EV_KEY
+                    if event.code == BTN_LEFT and event.value == 1:
+                        self._left_press_time = time.time()
+                        self._check_pending = False
+                        self.root.after(0, self.popup.hide)
+                    elif event.code == BTN_LEFT and event.value == 0:
+                        held = time.time() - self._left_press_time
+                        if held > 0.15:
+                            self._check_pending = True
+                            self.root.after(CHECK_DELAY, self._check_selection)
+                    elif event.code == BTN_RIGHT and event.value == 1:
+                        self._check_pending = False
+                        self.root.after(0, self.popup.hide)
+        except OSError:
+            pass
+
+    def _check_selection(self):
+        if self.paused or not self._check_pending:
             return
-
-        # Leer selección
+        self._check_pending = False
         selected_text = get_selected_text()
-
         if selected_text != self.previous_text and selected_text.strip():
             cx, cy = get_cursor_position(self.root)
             self.popup.show(selected_text, cx, cy - 45)
-            self._show_time = time.time()
             self.previous_text = selected_text
-            self._no_change_count = 0
-            self._schedule_poll(FAST_POLL)
-        else:
-            self._no_change_count += 1
-            # Después de 3 polls sin cambio, ir a modo lento
-            if self._no_change_count >= 3:
-                self._schedule_poll(SLOW_POLL)
-            else:
-                self._schedule_poll(FAST_POLL)
+            self._cancel_hide_timer()
+            self._hide_timer = self.root.after(HIDE_AFTER, self.popup.hide)
 
-    def _toggle_pause(self, icon, item):
-        self.paused = not self.paused
-        icon.update_menu()
+    def _cancel_hide_timer(self):
+        if self._hide_timer is not None:
+            self.root.after_cancel(self._hide_timer)
+            self._hide_timer = None
 
-    def _quit(self, icon, item):
-        icon.stop()
+    def _fallback_polling(self):
+        """Polling lento como respaldo si evdev no funciona."""
+        def poll():
+            if not self.paused and not self.popup.visible:
+                selected_text = get_selected_text()
+                if selected_text != self.previous_text and selected_text.strip():
+                    cx, cy = get_cursor_position(self.root)
+                    self.popup.show(selected_text, cx, cy - 45)
+                    self.previous_text = selected_text
+                    self._cancel_hide_timer()
+                    self._hide_timer = self.root.after(HIDE_AFTER, self.popup.hide)
+            elif self.popup.visible and self._hide_timer is None:
+                self._hide_timer = self.root.after(HIDE_AFTER, self.popup.hide)
+            self.root.after(3000, poll)
+        self.root.after(3000, poll)
+
+    def _quit(self):
         self.root.after(0, self.root.destroy)
 
     def _start_tray(self):
-        menu = pystray.Menu(
-            pystray.MenuItem(
-                lambda _: 'Reanudar' if self.paused else 'Pausar',
-                self._toggle_pause),
-            pystray.MenuItem('Salir', self._quit))
-        self.tray_icon = pystray.Icon(
-            'popup-linux', create_tray_icon_image(),
-            'Popup Linux', menu)
-        self.tray_icon.run_detached()
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'popup-linux.png')
+        if not os.path.exists(icon_path):
+            create_tray_icon_image().save(icon_path)
+
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self._sni = TrayIcon(icon_path, self)
+
+        t = threading.Thread(target=GLib.MainLoop().run, daemon=True)
+        t.start()
 
     def run(self):
         self.root.mainloop()
@@ -302,7 +445,36 @@ def check_dependencies():
         raise SystemExit(1)
 
 
+LOCK_FILE = '/tmp/popup-linux.lock'
+
+
+def ensure_single_instance():
+    """Si ya hay una instancia corriendo, salir."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)  # chequear si el proceso existe
+            print(f'Popup Linux ya está corriendo (PID {pid})')
+            raise SystemExit(0)
+        except (ValueError, ProcessLookupError, OSError):
+            pass  # PID inválido o proceso muerto, continuar
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+
+def cleanup_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 if __name__ == '__main__':
     check_dependencies()
-    app = App()
-    app.run()
+    ensure_single_instance()
+    try:
+        app = App()
+        app.run()
+    finally:
+        cleanup_lock()
