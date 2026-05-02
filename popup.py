@@ -7,6 +7,7 @@ import shutil
 import re
 import time
 import glob
+import queue
 import selectors
 import threading
 import webbrowser
@@ -192,6 +193,21 @@ TEXT = '#d4d4d4'
 TEXT_HOVER = '#ffffff'
 BORDER_COLOR = '#0a0a0a'
 ICON_SIZE = 16
+RADIUS = 12
+PAD = 6
+
+
+def draw_rounded_rect(canvas, x1, y1, x2, y2, r, fill, outline=''):
+    """Polígono suavizado simulando un rectángulo redondeado."""
+    pts = [
+        x1 + r, y1,  x2 - r, y1,
+        x2,     y1,  x2,     y1 + r,
+        x2,     y2 - r, x2,  y2,
+        x2 - r, y2,  x1 + r, y2,
+        x1,     y2,  x1,     y2 - r,
+        x1,     y1 + r, x1,  y1,
+    ]
+    return canvas.create_polygon(pts, smooth=True, fill=fill, outline=outline)
 
 
 def draw_copy_icon(canvas, x, y, color):
@@ -228,16 +244,31 @@ class PopupBar:
         self.win.attributes('-type', 'tooltip')
         self.win.attributes('-topmost', True)
         self.win.configure(bg=BORDER_COLOR)
+        try:
+            self.win.attributes('-alpha', 0.97)
+        except tk.TclError:
+            pass
         self.win.geometry('+99999+99999')
 
-        outer = tk.Frame(self.win, bg=BORDER_COLOR, padx=1, pady=1)
-        outer.pack(fill=tk.BOTH, expand=True)
-        self.bar = tk.Frame(outer, bg=BG)
-        self.bar.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(self.win, bg=BORDER_COLOR,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack()
 
+        self.bar = tk.Frame(self.canvas, bg=BG)
         self._add_button('Copiar', draw_copy_icon, self._copy)
         self._add_button('Código', draw_code_icon, self._copy_code)
         self._add_button('Buscar', draw_search_icon, self._search)
+
+        self.bar.update_idletasks()
+        bw = self.bar.winfo_reqwidth()
+        bh = self.bar.winfo_reqheight()
+        cw = bw + 2 * PAD
+        ch = bh + 2 * PAD
+        self.canvas.configure(width=cw, height=ch)
+        draw_rounded_rect(self.canvas, 0, 0, cw, ch, RADIUS, fill=BG)
+        self.canvas.create_window(PAD, PAD, anchor='nw', window=self.bar,
+                                  width=bw, height=bh)
+
         self.win.bind('<Escape>', lambda e: self.hide())
         self.win.update_idletasks()
 
@@ -422,8 +453,12 @@ class App:
         self._hide_timer = None
         self._left_press_time = 0
         self._check_pending = False
+        # Tkinter/Tcl no es thread-safe: el mouse y GLib threads solo
+        # encolan acá, el main loop drena en _drain_events.
+        self._event_queue = queue.Queue()
         self._start_mouse_thread()
         self._start_tray()
+        self.root.after(20, self._drain_events)
 
     def _start_mouse_thread(self):
         devices = find_mouse_devices()
@@ -440,17 +475,34 @@ class App:
         if event.type != 1:  # EV_KEY
             return
         if event.code == BTN_LEFT and event.value == 1:
-            self._left_press_time = time.time()
-            self._check_pending = False
-            self.root.after(0, self.popup.hide)
+            self._event_queue.put(('left_press', time.time()))
         elif event.code == BTN_LEFT and event.value == 0:
-            held = time.time() - self._left_press_time
-            if held > 0.15:
-                self._check_pending = True
-                self.root.after(CHECK_DELAY, self._check_selection)
+            self._event_queue.put(('left_release', time.time()))
         elif event.code == BTN_RIGHT and event.value == 1:
-            self._check_pending = False
-            self.root.after(0, self.popup.hide)
+            self._event_queue.put(('right_press', None))
+
+    def _drain_events(self):
+        try:
+            while True:
+                kind, payload = self._event_queue.get_nowait()
+                if kind == 'left_press':
+                    self._left_press_time = payload
+                    self._check_pending = False
+                    self.popup.hide()
+                elif kind == 'left_release':
+                    held = payload - self._left_press_time
+                    if held > 0.15:
+                        self._check_pending = True
+                        self.root.after(CHECK_DELAY, self._check_selection)
+                elif kind == 'right_press':
+                    self._check_pending = False
+                    self.popup.hide()
+                elif kind == 'quit':
+                    self.root.destroy()
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(20, self._drain_events)
 
     def _mouse_loop(self):
         """Escucha todos los mouse en paralelo y se recupera de fallos.
@@ -544,7 +596,7 @@ class App:
         self.root.after(3000, poll)
 
     def _quit(self):
-        self.root.after(0, self.root.destroy)
+        self._event_queue.put(('quit', None))
 
     def _start_tray(self):
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
