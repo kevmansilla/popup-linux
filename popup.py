@@ -7,6 +7,7 @@ import shutil
 import re
 import time
 import glob
+import selectors
 import threading
 import webbrowser
 from urllib.parse import quote_plus
@@ -352,31 +353,84 @@ class App:
             print('Aviso: no se encontraron dispositivos de mouse, usando polling')
             self._fallback_polling()
             return
-        # Usar solo el primer dispositivo de mouse para evitar duplicados
-        dev = devices[0]
-        for d in devices[1:]:
+        for d in devices:
             d.close()
-        t = threading.Thread(target=self._mouse_loop, args=(dev,), daemon=True)
+        t = threading.Thread(target=self._mouse_loop, daemon=True)
         t.start()
 
-    def _mouse_loop(self, dev):
-        try:
-            for event in dev.read_loop():
-                if event.type == 1:  # EV_KEY
-                    if event.code == BTN_LEFT and event.value == 1:
-                        self._left_press_time = time.time()
-                        self._check_pending = False
-                        self.root.after(0, self.popup.hide)
-                    elif event.code == BTN_LEFT and event.value == 0:
-                        held = time.time() - self._left_press_time
-                        if held > 0.15:
-                            self._check_pending = True
-                            self.root.after(CHECK_DELAY, self._check_selection)
-                    elif event.code == BTN_RIGHT and event.value == 1:
-                        self._check_pending = False
-                        self.root.after(0, self.popup.hide)
-        except OSError:
-            pass
+    def _handle_input_event(self, event):
+        if event.type != 1:  # EV_KEY
+            return
+        if event.code == BTN_LEFT and event.value == 1:
+            self._left_press_time = time.time()
+            self._check_pending = False
+            self.root.after(0, self.popup.hide)
+        elif event.code == BTN_LEFT and event.value == 0:
+            held = time.time() - self._left_press_time
+            if held > 0.15:
+                self._check_pending = True
+                self.root.after(CHECK_DELAY, self._check_selection)
+        elif event.code == BTN_RIGHT and event.value == 1:
+            self._check_pending = False
+            self.root.after(0, self.popup.hide)
+
+    def _mouse_loop(self):
+        """Escucha todos los mouse en paralelo y se recupera de fallos.
+
+        Si un dispositivo se desconecta (USB autosuspend, replug, suspensión
+        del sistema), lo descarta y sigue con el resto. Cuando no quedan
+        dispositivos, re-escanea cada pocos segundos hasta encontrar uno.
+        """
+        while True:
+            devices = find_mouse_devices()
+            if not devices:
+                time.sleep(5)
+                continue
+
+            sel = selectors.DefaultSelector()
+            for dev in devices:
+                try:
+                    sel.register(dev.fileno(), selectors.EVENT_READ, dev)
+                except (OSError, ValueError) as e:
+                    print(f'No se pudo registrar {dev.path}: {e}')
+                    try:
+                        dev.close()
+                    except OSError:
+                        pass
+
+            try:
+                while sel.get_map():
+                    for key, _ in sel.select(timeout=30):
+                        dev = key.data
+                        try:
+                            for event in dev.read():
+                                self._handle_input_event(event)
+                        except OSError as e:
+                            print(f'Dispositivo {dev.path} falló ({e}), '
+                                  'descartando')
+                            try:
+                                sel.unregister(key.fileobj)
+                            except (KeyError, ValueError):
+                                pass
+                            try:
+                                dev.close()
+                            except OSError:
+                                pass
+            except Exception as e:
+                print(f'Error inesperado en mouse loop: {e}')
+            finally:
+                for key in list(sel.get_map().values()):
+                    try:
+                        sel.unregister(key.fileobj)
+                    except (KeyError, ValueError):
+                        pass
+                    try:
+                        key.data.close()
+                    except OSError:
+                        pass
+                sel.close()
+
+            time.sleep(2)
 
     def _check_selection(self):
         if self.paused or not self._check_pending:
