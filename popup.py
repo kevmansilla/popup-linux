@@ -49,6 +49,63 @@ def copy_to_clipboard(text):
     process.communicate(text.encode('utf-8'))
 
 
+def fix_wrapped_code(text):
+    """Une saltos de línea dentro de string literals.
+
+    Cuando el terminal envuelve líneas largas, mete \\n reales en medio
+    de strings (URLs, comandos con -r '...', etc). Esto rompe el código
+    al pegarlo. Esta función detecta esos saltos siguiendo el estado de
+    comillas (', ", `, ''' y \"\"\") y los elimina junto con la
+    indentación de la siguiente línea.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    state = None  # None, "'", '"', '`', "'''", '\"\"\"'
+
+    while i < n:
+        c = text[i]
+
+        if state is None and i + 2 < n and text[i:i+3] in ('"""', "'''"):
+            triple = text[i:i+3]
+            end = text.find(triple, i + 3)
+            if end >= 0:
+                out.append(text[i:end + 3])
+                i = end + 3
+            else:
+                out.append(text[i:])
+                i = n
+            continue
+
+        if state is None and c in ('"', "'", '`'):
+            state = c
+            out.append(c)
+            i += 1
+            continue
+
+        if state in ('"', "'", '`'):
+            if c == '\\' and i + 1 < n:
+                out.append(c)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == state:
+                state = None
+                out.append(c)
+                i += 1
+                continue
+            if c == '\n':
+                i += 1
+                while i < n and text[i] in ' \t':
+                    i += 1
+                continue
+
+        out.append(c)
+        i += 1
+
+    return ''.join(out)
+
+
 # --- Posición del cursor (KDE Wayland via KWin scripting) ---
 
 KWIN_SCRIPT_PATH = '/tmp/selecton_cursorpos.js'
@@ -129,22 +186,35 @@ def create_tray_icon_image():
 
 # --- Popup estilo Selecton ---
 
-BG = '#333333'
-BG_HOVER = '#444444'
-TEXT = '#ffffff'
-BORDER_COLOR = '#222222'
-SEPARATOR = '#4a4a4a'
-ICON_SIZE = 18
+BG = '#1c1c1c'
+BG_HOVER = '#2d2d2d'
+TEXT = '#d4d4d4'
+TEXT_HOVER = '#ffffff'
+BORDER_COLOR = '#0a0a0a'
+ICON_SIZE = 16
 
 
 def draw_copy_icon(canvas, x, y, color):
-    canvas.create_rectangle(x+2, y+4, x+11, y+15, outline=color, width=1.2)
-    canvas.create_rectangle(x+5, y+1, x+14, y+12, outline=color, fill=BG, width=1.2)
+    canvas.create_rectangle(
+        x+5, y+1, x+14, y+11, outline=color, width=1.3)
+    canvas.create_rectangle(
+        x+1, y+5, x+10, y+15, outline=color, fill=BG, width=1.3)
 
 
 def draw_search_icon(canvas, x, y, color):
-    canvas.create_oval(x+1, y+1, x+10, y+10, outline=color, width=1.4)
-    canvas.create_line(x+9, y+9, x+14, y+14, fill=color, width=1.4)
+    canvas.create_oval(x+1, y+1, x+10, y+10, outline=color, width=1.3)
+    canvas.create_line(
+        x+8, y+8, x+14, y+14,
+        fill=color, width=1.5, capstyle='round')
+
+
+def draw_code_icon(canvas, x, y, color):
+    canvas.create_line(
+        x+5, y+3, x+1, y+8, x+5, y+13,
+        fill=color, width=1.3, joinstyle='round', capstyle='round')
+    canvas.create_line(
+        x+10, y+3, x+14, y+8, x+10, y+13,
+        fill=color, width=1.3, joinstyle='round', capstyle='round')
 
 
 class PopupBar:
@@ -166,7 +236,7 @@ class PopupBar:
         self.bar.pack(fill=tk.BOTH, expand=True)
 
         self._add_button('Copiar', draw_copy_icon, self._copy)
-        self._add_sep()
+        self._add_button('Código', draw_code_icon, self._copy_code)
         self._add_button('Buscar', draw_search_icon, self._search)
         self.win.bind('<Escape>', lambda e: self.hide())
         self.win.update_idletasks()
@@ -176,25 +246,29 @@ class PopupBar:
         btn_frame.pack(side=tk.LEFT)
         icon = tk.Canvas(btn_frame, width=ICON_SIZE, height=ICON_SIZE,
                          bg=BG, highlightthickness=0)
-        icon.pack(side=tk.LEFT, padx=(10, 3), pady=8)
-        icon_fn(icon, 1, 1, TEXT)
-        lbl = tk.Label(btn_frame, text=label, font=('Sans', 10),
+        icon.pack(side=tk.LEFT, padx=(12, 5), pady=7)
+        icon_fn(icon, 0, 0, TEXT)
+        lbl = tk.Label(btn_frame, text=label, font=('Sans', 9),
                        fg=TEXT, bg=BG, cursor='hand2')
-        lbl.pack(side=tk.LEFT, padx=(0, 10), pady=8)
+        lbl.pack(side=tk.LEFT, padx=(0, 12), pady=7)
+
+        def redraw(c, color):
+            c.delete('all')
+            icon_fn(c, 0, 0, color)
 
         def on_enter(e, f=btn_frame, ic=icon, lb=lbl):
             for w in (f, ic, lb): w.configure(bg=BG_HOVER)
+            lb.configure(fg=TEXT_HOVER)
+            redraw(ic, TEXT_HOVER)
         def on_leave(e, f=btn_frame, ic=icon, lb=lbl):
             for w in (f, ic, lb): w.configure(bg=BG)
+            lb.configure(fg=TEXT)
+            redraw(ic, TEXT)
 
         for widget in (btn_frame, icon, lbl):
             widget.bind('<Button-1>', lambda e, c=cmd: c())
             widget.bind('<Enter>', on_enter)
             widget.bind('<Leave>', on_leave)
-
-    def _add_sep(self):
-        tk.Frame(self.bar, bg=SEPARATOR, width=1).pack(
-            side=tk.LEFT, fill=tk.Y, pady=6)
 
     def show(self, text, x, y):
         self.selected_text = text
@@ -208,6 +282,10 @@ class PopupBar:
 
     def _copy(self):
         copy_to_clipboard(self.selected_text)
+        self.hide()
+
+    def _copy_code(self):
+        copy_to_clipboard(fix_wrapped_code(self.selected_text))
         self.hide()
 
     def _search(self):
