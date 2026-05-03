@@ -1,9 +1,11 @@
 import os
 os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 
+import ast
 import tkinter as tk
 import subprocess
 import shutil
+import operator
 import re
 import time
 import glob
@@ -48,6 +50,76 @@ def copy_to_clipboard(text):
         cmd = ['xclip', '-selection', 'clipboard']
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     process.communicate(text.encode('utf-8'))
+
+
+# --- Detección contextual del contenido seleccionado ---
+
+_URL_PROTO_RE = re.compile(r'^(https?|ftp|file)://\S+$', re.IGNORECASE)
+_URL_BARE_RE = re.compile(
+    r'^[a-z0-9][\w-]*(\.[a-z0-9][\w-]*)+(/\S*)?$', re.IGNORECASE)
+_MATH_CHARS_RE = re.compile(r'^[\d\s+\-*/().]+$')
+_SAFE_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+
+def safe_eval(expr):
+    def _eval(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+            return _SAFE_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
+            return _SAFE_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError('expr no permitida')
+    return _eval(ast.parse(expr, mode='eval').body)
+
+
+_COMMON_TLDS = frozenset((
+    'com org net edu gov mil int io co me ai app dev cloud tech '
+    'info biz name site online store xyz '
+    'ar es mx br cl pe uy us uk de fr it nl be ch at ru pl cz '
+    'jp cn kr in au nz ca za tr ng eg sa tv fm ly gg to ws gl la'
+).split())
+
+
+def is_url(s):
+    if _URL_PROTO_RE.match(s):
+        return True
+    if '@' in s or any(ch.isspace() for ch in s):
+        return False
+    if s.lower().startswith('www.'):
+        return True
+    if _URL_BARE_RE.match(s):
+        host = s.split('/', 1)[0]
+        tld = host.rsplit('.', 1)[-1].lower()
+        return tld in _COMMON_TLDS
+    return False
+
+
+def is_path(s):
+    if not (s.startswith(('/', '~/', './', '../')) or s == '~'):
+        return False
+    try:
+        return os.path.exists(os.path.expanduser(s))
+    except (OSError, ValueError):
+        return False
+
+
+def is_math(s):
+    if not _MATH_CHARS_RE.match(s):
+        return False
+    if not any(op in s for op in '+-*/'):
+        return False
+    try:
+        safe_eval(s)
+        return True
+    except Exception:
+        return False
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
@@ -429,11 +501,29 @@ def draw_code_icon(canvas, x, y, color):
         fill=color, width=1.2, joinstyle='round', capstyle='round')
 
 
+def draw_open_icon(canvas, x, y, color):
+    # Caja abajo-izq + flecha saliendo arriba-derecha
+    canvas.create_rectangle(x+1, y+5, x+8, y+12, outline=color, width=1.2)
+    canvas.create_line(x+5, y+8, x+12, y+1,
+                       fill=color, width=1.4, capstyle='round')
+    canvas.create_line(x+8, y+1, x+12, y+1, fill=color, width=1.2)
+    canvas.create_line(x+12, y+1, x+12, y+5, fill=color, width=1.2)
+
+
+def draw_calc_icon(canvas, x, y, color):
+    # Signo "=" de doble línea
+    canvas.create_line(x+2, y+5, x+11, y+5,
+                       fill=color, width=1.4, capstyle='round')
+    canvas.create_line(x+2, y+9, x+11, y+9,
+                       fill=color, width=1.4, capstyle='round')
+
+
 class PopupBar:
     def __init__(self, root):
         self.root = root
         self.selected_text = ''
         self.visible = False
+        self._smart_kind = 'search'
 
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
@@ -453,22 +543,15 @@ class PopupBar:
         self.bar = tk.Frame(self.canvas, bg=BG)
         self._add_button('Copiar', draw_copy_icon, self._copy)
         self._add_button('Código', draw_code_icon, self._copy_code)
-        self._add_button('Buscar', draw_search_icon, self._search)
+        self._smart_btn = self._add_button(
+            'Buscar', draw_search_icon, self._smart_action)
 
-        self.bar.update_idletasks()
-        bw = self.bar.winfo_reqwidth()
-        bh = self.bar.winfo_reqheight()
-        cw = bw + 2 * PAD
-        ch = bh + 2 * PAD
-        self.canvas.configure(width=cw, height=ch)
-        draw_rounded_rect(self.canvas, 0, 0, cw, ch, RADIUS, fill=BG)
-        self.canvas.create_window(PAD, PAD, anchor='nw', window=self.bar,
-                                  width=bw, height=bh)
-
+        self._reflow()
         self.win.bind('<Escape>', lambda e: self.hide())
         self.win.update_idletasks()
 
     def _add_button(self, label, icon_fn, cmd):
+        btn = {'icon_fn': icon_fn, 'cmd': cmd}
         btn_frame = tk.Frame(self.bar, bg=BG, cursor='hand2')
         btn_frame.pack(side=tk.LEFT)
         icon = tk.Canvas(btn_frame, width=ICON_SIZE, height=ICON_SIZE,
@@ -478,27 +561,68 @@ class PopupBar:
         lbl = tk.Label(btn_frame, text=label, font=('Sans', 8),
                        fg=TEXT, bg=BG, cursor='hand2')
         lbl.pack(side=tk.LEFT, padx=(0, 8), pady=4)
+        btn.update(frame=btn_frame, icon=icon, lbl=lbl)
 
-        def redraw(c, color):
-            c.delete('all')
-            icon_fn(c, 0, 0, color)
+        def on_enter(_e):
+            for w in (btn_frame, icon, lbl):
+                w.configure(bg=BG_HOVER)
+            lbl.configure(fg=TEXT_HOVER)
+            icon.delete('all')
+            btn['icon_fn'](icon, 0, 0, TEXT_HOVER)
 
-        def on_enter(e, f=btn_frame, ic=icon, lb=lbl):
-            for w in (f, ic, lb): w.configure(bg=BG_HOVER)
-            lb.configure(fg=TEXT_HOVER)
-            redraw(ic, TEXT_HOVER)
-        def on_leave(e, f=btn_frame, ic=icon, lb=lbl):
-            for w in (f, ic, lb): w.configure(bg=BG)
-            lb.configure(fg=TEXT)
-            redraw(ic, TEXT)
+        def on_leave(_e):
+            for w in (btn_frame, icon, lbl):
+                w.configure(bg=BG)
+            lbl.configure(fg=TEXT)
+            icon.delete('all')
+            btn['icon_fn'](icon, 0, 0, TEXT)
+
+        def on_click(_e):
+            btn['cmd']()
 
         for widget in (btn_frame, icon, lbl):
-            widget.bind('<Button-1>', lambda e, c=cmd: c())
+            widget.bind('<Button-1>', on_click)
             widget.bind('<Enter>', on_enter)
             widget.bind('<Leave>', on_leave)
+        return btn
+
+    def _update_button(self, btn, label, icon_fn):
+        btn['icon_fn'] = icon_fn
+        btn['lbl'].configure(text=label)
+        btn['icon'].delete('all')
+        icon_fn(btn['icon'], 0, 0, TEXT)
+
+    def _reflow(self):
+        """Recalcula tamaño del canvas según el contenido del bar."""
+        self.bar.update_idletasks()
+        bw = self.bar.winfo_reqwidth()
+        bh = self.bar.winfo_reqheight()
+        cw = bw + 2 * PAD
+        ch = bh + 2 * PAD
+        self.canvas.configure(width=cw, height=ch)
+        self.canvas.delete('all')
+        draw_rounded_rect(self.canvas, 0, 0, cw, ch, RADIUS, fill=BG)
+        self.canvas.create_window(PAD, PAD, anchor='nw', window=self.bar,
+                                  width=bw, height=bh)
+
+    def _detect_smart(self, text):
+        s = text.strip()
+        if not s:
+            return ('search', 'Buscar', draw_search_icon)
+        if is_url(s):
+            return ('open_url', 'Abrir', draw_open_icon)
+        if is_path(s):
+            return ('open_path', 'Abrir', draw_open_icon)
+        if is_math(s):
+            return ('calc', 'Calcular', draw_calc_icon)
+        return ('search', 'Buscar', draw_search_icon)
 
     def show(self, text, x, y):
         self.selected_text = text
+        kind, label, icon_fn = self._detect_smart(text)
+        self._smart_kind = kind
+        self._update_button(self._smart_btn, label, icon_fn)
+        self._reflow()
         self.win.geometry(f'+{x}+{y}')
         self.visible = True
 
@@ -515,9 +639,29 @@ class PopupBar:
         copy_to_clipboard(fix_wrapped_code(self.selected_text))
         self.hide()
 
-    def _search(self):
-        webbrowser.open('https://www.google.com/search?q='
-                        + quote_plus(self.selected_text))
+    def _smart_action(self):
+        s = self.selected_text.strip()
+        if self._smart_kind == 'open_url':
+            url = s if '://' in s else 'https://' + s
+            webbrowser.open(url)
+        elif self._smart_kind == 'open_path':
+            subprocess.Popen(
+                ['xdg-open', os.path.expanduser(s)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        elif self._smart_kind == 'calc':
+            try:
+                result = safe_eval(s)
+                # Mostrar entero si el resultado es entero exacto
+                if isinstance(result, float) and result.is_integer():
+                    result = int(result)
+                copy_to_clipboard(f'{s} = {result}')
+            except Exception:
+                copy_to_clipboard(s)
+        else:
+            webbrowser.open('https://www.google.com/search?q='
+                            + quote_plus(self.selected_text))
+        self.hide()
 
 
 # --- Detección de mouse vía evdev ---
@@ -643,6 +787,9 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
+        # Tkinter/Tcl no es thread-safe: el mouse y GLib threads solo
+        # encolan acá, el main loop drena en _drain_events.
+        self._event_queue = queue.Queue()
         self.popup = PopupBar(self.root)
         self.paused = False
         self.previous_text = get_selected_text()
@@ -650,9 +797,6 @@ class App:
         self._left_press_time = 0
         self._last_release_time = 0
         self._check_pending = False
-        # Tkinter/Tcl no es thread-safe: el mouse y GLib threads solo
-        # encolan acá, el main loop drena en _drain_events.
-        self._event_queue = queue.Queue()
         self._start_mouse_thread()
         self._start_tray()
         self.root.after(20, self._drain_events)
