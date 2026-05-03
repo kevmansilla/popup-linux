@@ -50,24 +50,170 @@ def copy_to_clipboard(text):
     process.communicate(text.encode('utf-8'))
 
 
-def fix_wrapped_code(text):
-    """Une saltos de línea dentro de string literals.
+_ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+_PROMPT_USER_RE = re.compile(r'^[\w.-]+@[\w.-]+:\S*[\$#%]\s+')
+_PROMPT_SIMPLE_RE = re.compile(r'^[\$#%>]\s+')
+_PS_PROMPT_RE = re.compile(r'^PS\s+[A-Za-z]:[^>]*>\s+')
+_LINE_NUM_RE = re.compile(r'^\s*\d+\s*[|:│┃▏](\s?)(.*)$')
 
-    Cuando el terminal envuelve líneas largas, mete \\n reales en medio
-    de strings (URLs, comandos con -r '...', etc). Esto rompe el código
-    al pegarlo. Esta función detecta esos saltos siguiendo el estado de
-    comillas (', ", `, ''' y \"\"\") y los elimina junto con la
-    indentación de la siguiente línea.
+
+def _normalize_invisible(text):
+    """CRLF→LF, NBSP→space, quita BOM y zero-width chars."""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = text.replace(' ', ' ')           # NBSP
+    text = text.replace(' ', '\n').replace(' ', '\n')  # line/para sep
+    for ch in ('​', '‌', '‍', '﻿'):
+        text = text.replace(ch, '')
+    return _ANSI_RE.sub('', text)
+
+
+def _normalize_quotes(text):
+    """Smart quotes y dashes Unicode → ASCII."""
+    return (text
+            .replace('‘', "'").replace('’', "'")
+            .replace('“', '"').replace('”', '"')
+            .replace('–', '-').replace('—', '-')
+            .replace('…', '...'))
+
+
+def _strip_shell_prompts(text):
+    """Quita prompts de shell al inicio de línea (PS1/PS2).
+
+    Solo se aplica si al menos 2 líneas (no vacías) tienen prompt — evita
+    tocar código que casualmente arranca con `$`.
+    """
+    lines = text.split('\n')
+    matchers = (_PROMPT_USER_RE, _PS_PROMPT_RE, _PROMPT_SIMPLE_RE)
+    hits = 0
+    for line in lines:
+        s = line.lstrip()
+        if any(p.match(s) for p in matchers):
+            hits += 1
+    if hits < 2:
+        return text
+    out = []
+    for line in lines:
+        s = line.lstrip()
+        for p in matchers:
+            m = p.match(s)
+            if m:
+                out.append(s[m.end():])
+                break
+        else:
+            out.append(line)
+    return '\n'.join(out)
+
+
+def _strip_line_numbers(text):
+    """Quita prefijos de número de línea (cat -n, less +N, copy de IDE)."""
+    lines = text.split('\n')
+    matches = [_LINE_NUM_RE.match(line) for line in lines]
+    hit = sum(1 for m in matches if m)
+    if hit < 2 or hit < len([l for l in lines if l.strip()]) * 0.6:
+        return text
+    return '\n'.join(
+        m.group(2) if m else line
+        for m, line in zip(matches, lines)
+    )
+
+
+def _trim_trailing_ws(text):
+    return '\n'.join(line.rstrip() for line in text.split('\n'))
+
+
+def _heredoc_end(text, start):
+    """Si en `start` arranca `<<MARKER` válido, devuelve la posición justo
+    después del terminador. Si no es heredoc, devuelve None.
+
+    Soporta `<<MARKER`, `<<-MARKER` (terminador con tabs líderes), y
+    `<<'MARKER'`/`<<"MARKER"` (sin diferencia para nuestros fines).
+    """
+    n = len(text)
+    j = start + 2
+    dash = False
+    if j < n and text[j] == '-':
+        dash = True
+        j += 1
+    while j < n and text[j] in ' \t':
+        j += 1
+    quote = None
+    if j < n and text[j] in ('"', "'"):
+        quote = text[j]
+        j += 1
+    mstart = j
+    while j < n and (text[j].isalnum() or text[j] == '_'):
+        j += 1
+    marker = text[mstart:j]
+    if not marker:
+        return None
+    if quote:
+        if j >= n or text[j] != quote:
+            return None
+        j += 1
+    nl = text.find('\n', j)
+    if nl < 0:
+        return None
+    pos = nl + 1
+    while pos <= n:
+        next_nl = text.find('\n', pos)
+        line_end = next_nl if next_nl >= 0 else n
+        line = text[pos:line_end]
+        check = line.lstrip('\t') if dash else line
+        if check == marker:
+            return line_end
+        if next_nl < 0:
+            return None
+        pos = next_nl + 1
+    return None
+
+
+def _join_continuations_and_wrap(text):
+    """Resuelve continuaciones `\\<nl>` y newlines insertados por wrap.
+
+    - `\\` + (espacios opcionales) + `\\n` + (indentación): fuera de string
+      → un espacio; dentro de "..." o `...` → nada (igual que bash).
+    - `\\` + ≥4 espacios sin `\\n` (terminal copió wrap sin newline) → idem.
+    - `\\n` + indent dentro de string literal → vacío.
+    - Triple comilla (\"\"\"/''') se preserva literal.
+    - Single quotes ('...'): `\\` es literal, no se toca.
     """
     out = []
     i = 0
     n = len(text)
-    state = None  # None, "'", '"', '`', "'''", '\"\"\"'
+    state = None  # None | '"' | "'" | '`'
+    in_comment = False
 
     while i < n:
         c = text[i]
 
-        if state is None and i + 2 < n and text[i:i+3] in ('"""', "'''"):
+        # Cierre de comentario al newline (todo dentro es literal)
+        if in_comment:
+            out.append(c)
+            if c == '\n':
+                in_comment = False
+            i += 1
+            continue
+
+        # Inicio de comentario: # al inicio o después de whitespace/;
+        if state is None and c == '#':
+            prev = out[-1] if out else '\n'
+            if prev in ' \t\n;':
+                in_comment = True
+                out.append(c)
+                i += 1
+                continue
+
+        # Heredoc shell (<<MARKER, <<-MARKER, <<'MARKER', <<"MARKER")
+        # Preserva el cuerpo verbatim hasta encontrar el terminador.
+        if (state is None and c == '<' and i + 1 < n and text[i+1] == '<'
+                and not (i + 2 < n and text[i+2] == '<')):
+            end = _heredoc_end(text, i)
+            if end is not None:
+                out.append(text[i:end])
+                i = end
+                continue
+
+        if state is None and i + 3 <= n and text[i:i+3] in ('"""', "'''"):
             triple = text[i:i+3]
             end = text.find(triple, i + 3)
             if end >= 0:
@@ -78,14 +224,33 @@ def fix_wrapped_code(text):
                 i = n
             continue
 
+        if c == '\\' and state != "'":
+            j = i + 1
+            while j < n and text[j] in ' \t':
+                j += 1
+            ws_after_bs = j - (i + 1)
+            if j < n and text[j] == '\n':
+                j += 1
+                while j < n and text[j] in ' \t':
+                    j += 1
+                if state is None and out and out[-1] not in ' \t\n':
+                    out.append(' ')
+                i = j
+                continue
+            if ws_after_bs >= 4:
+                if state is None and out and out[-1] not in ' \t\n':
+                    out.append(' ')
+                i = j
+                continue
+
         if state is None and c in ('"', "'", '`'):
             state = c
             out.append(c)
             i += 1
             continue
 
-        if state in ('"', "'", '`'):
-            if c == '\\' and i + 1 < n:
+        if state is not None:
+            if c == '\\' and state in ('"', '`') and i + 1 < n:
                 out.append(c)
                 out.append(text[i + 1])
                 i += 2
@@ -99,12 +264,43 @@ def fix_wrapped_code(text):
                 i += 1
                 while i < n and text[i] in ' \t':
                     i += 1
+                # Insertar espacio para no pegar palabras (SELECT users WHERE),
+                # pero evitar romper URLs/paths (users?id, /api/v1)
+                url_chars = '/?&=:.#'
+                if (out and out[-1] not in ' \t' + url_chars
+                        and i < n and text[i] != state
+                        and text[i] not in url_chars):
+                    out.append(' ')
                 continue
 
         out.append(c)
         i += 1
 
     return ''.join(out)
+
+
+def fix_wrapped_code(text):
+    """Limpia código copiado desde terminales, IDEs, web o PDFs.
+
+    Pipeline:
+    1. Normaliza invisibles: CRLF→LF, NBSP→space, BOM/zero-width fuera,
+       quita secuencias ANSI de color.
+    2. Smart quotes (“”‘’), em/en dash, ellipsis → ASCII.
+    3. Quita prompts de shell (`$ `, `# `, `> `, `user@host:~$ `, `PS C:\\>`)
+       solo si aparecen en ≥2 líneas (no destruye código con `$` legítimo).
+    4. Quita prefijos de número de línea (`  12 | ...`) si la mayoría de
+       las líneas con texto los tienen.
+    5. Trim de whitespace al final de cada línea.
+    6. Resuelve continuaciones `\\<nl>` (incluso con espacios artefacto del
+       wrap del terminal) y newlines insertados por wrap dentro de strings.
+    """
+    text = _normalize_invisible(text)
+    text = _normalize_quotes(text)
+    text = _strip_shell_prompts(text)
+    text = _strip_line_numbers(text)
+    text = _trim_trailing_ws(text)
+    text = _join_continuations_and_wrap(text)
+    return text
 
 
 # --- Posición del cursor (KDE Wayland via KWin scripting) ---
@@ -192,9 +388,9 @@ BG_HOVER = '#2d2d2d'
 TEXT = '#d4d4d4'
 TEXT_HOVER = '#ffffff'
 BORDER_COLOR = '#0a0a0a'
-ICON_SIZE = 16
-RADIUS = 12
-PAD = 6
+ICON_SIZE = 13
+RADIUS = 9
+PAD = 4
 
 
 def draw_rounded_rect(canvas, x1, y1, x2, y2, r, fill, outline=''):
@@ -212,25 +408,25 @@ def draw_rounded_rect(canvas, x1, y1, x2, y2, r, fill, outline=''):
 
 def draw_copy_icon(canvas, x, y, color):
     canvas.create_rectangle(
-        x+5, y+1, x+14, y+11, outline=color, width=1.3)
+        x+4, y+1, x+12, y+9, outline=color, width=1.2)
     canvas.create_rectangle(
-        x+1, y+5, x+10, y+15, outline=color, fill=BG, width=1.3)
+        x+1, y+4, x+9, y+12, outline=color, fill=BG, width=1.2)
 
 
 def draw_search_icon(canvas, x, y, color):
-    canvas.create_oval(x+1, y+1, x+10, y+10, outline=color, width=1.3)
+    canvas.create_oval(x+1, y+1, x+9, y+9, outline=color, width=1.2)
     canvas.create_line(
-        x+8, y+8, x+14, y+14,
-        fill=color, width=1.5, capstyle='round')
+        x+7, y+7, x+12, y+12,
+        fill=color, width=1.4, capstyle='round')
 
 
 def draw_code_icon(canvas, x, y, color):
     canvas.create_line(
-        x+5, y+3, x+1, y+8, x+5, y+13,
-        fill=color, width=1.3, joinstyle='round', capstyle='round')
+        x+4, y+3, x+1, y+7, x+4, y+11,
+        fill=color, width=1.2, joinstyle='round', capstyle='round')
     canvas.create_line(
-        x+10, y+3, x+14, y+8, x+10, y+13,
-        fill=color, width=1.3, joinstyle='round', capstyle='round')
+        x+9, y+3, x+12, y+7, x+9, y+11,
+        fill=color, width=1.2, joinstyle='round', capstyle='round')
 
 
 class PopupBar:
@@ -277,11 +473,11 @@ class PopupBar:
         btn_frame.pack(side=tk.LEFT)
         icon = tk.Canvas(btn_frame, width=ICON_SIZE, height=ICON_SIZE,
                          bg=BG, highlightthickness=0)
-        icon.pack(side=tk.LEFT, padx=(12, 5), pady=7)
+        icon.pack(side=tk.LEFT, padx=(8, 3), pady=4)
         icon_fn(icon, 0, 0, TEXT)
-        lbl = tk.Label(btn_frame, text=label, font=('Sans', 9),
+        lbl = tk.Label(btn_frame, text=label, font=('Sans', 8),
                        fg=TEXT, bg=BG, cursor='hand2')
-        lbl.pack(side=tk.LEFT, padx=(0, 12), pady=7)
+        lbl.pack(side=tk.LEFT, padx=(0, 8), pady=4)
 
         def redraw(c, color):
             c.delete('all')
@@ -452,6 +648,7 @@ class App:
         self.previous_text = get_selected_text()
         self._hide_timer = None
         self._left_press_time = 0
+        self._last_release_time = 0
         self._check_pending = False
         # Tkinter/Tcl no es thread-safe: el mouse y GLib threads solo
         # encolan acá, el main loop drena en _drain_events.
@@ -491,7 +688,10 @@ class App:
                     self.popup.hide()
                 elif kind == 'left_release':
                     held = payload - self._left_press_time
-                    if held > 0.15:
+                    since_last = payload - self._last_release_time
+                    self._last_release_time = payload
+                    # Drag (>150ms) o doble/triple click (<400ms entre releases)
+                    if held > 0.15 or since_last < 0.4:
                         self._check_pending = True
                         self.root.after(CHECK_DELAY, self._check_selection)
                 elif kind == 'right_press':
@@ -567,7 +767,7 @@ class App:
             return
         self._check_pending = False
         selected_text = get_selected_text()
-        if selected_text != self.previous_text and selected_text.strip():
+        if selected_text.strip():
             cx, cy = get_cursor_position(self.root)
             self.popup.show(selected_text, cx, cy - 45)
             self.previous_text = selected_text
