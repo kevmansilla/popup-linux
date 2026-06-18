@@ -193,12 +193,85 @@ def _trim_trailing_ws(text):
     return '\n'.join(line.rstrip() for line in text.split('\n'))
 
 
-def _heredoc_end(text, start):
-    """Si en `start` arranca `<<MARKER` válido, devuelve la posición justo
-    después del terminador. Si no es heredoc, devuelve None.
+# Intérpretes cuyo heredoc contiene código (no texto literal): su cuerpo se
+# desenrolla recursivamente en vez de preservarse verbatim.
+_INTERPRETERS = frozenset((
+    'python python3 python2 node nodejs deno bun ruby perl php '
+    'bash sh zsh fish lua osascript Rscript psql'
+).split())
+_CODE_MARKER_RE = re.compile(
+    r'PY|PYTHON|NODE|JS|JAVASCRIPT|RUBY|RB|PERL|PHP|LUA|SQL', re.IGNORECASE)
 
-    Soporta `<<MARKER`, `<<-MARKER` (terminador con tabs líderes), y
-    `<<'MARKER'`/`<<"MARKER"` (sin diferencia para nuestros fines).
+# Palabras que, al inicio de una línea, delatan un statement nuevo: nunca son
+# la cola de un token partido por el wrap.
+_PY_KEYWORDS = frozenset((
+    'and as assert async await break class continue def del elif else except '
+    'finally for from global if import in is lambda nonlocal not or pass raise '
+    'return try while with yield match case print'
+).split())
+# Línea que arranca como asignación/anotación (`x =`, `x:`, `x +=`).
+_STMT_START_RE = re.compile(r'^[A-Za-z_]\w*\s*(?:[-+*/%|&^]|//|\*\*)?[=:](?![=])')
+_WORD_HEAD_RE = re.compile(r'\w+')
+
+
+def _heredoc_is_code(prefix, marker):
+    """¿El cuerpo de este heredoc es código (vs. texto literal)?
+
+    True si la línea que lo abre invoca un intérprete (`python - <<'EOF'`,
+    `docker exec ... python <<EOF`, `/usr/bin/node <<EOF`) o si el marcador
+    sugiere un lenguaje (`PYEOF`, `NODE`, `SQL`).
+    """
+    for tok in re.findall(r'[\w./-]+', prefix):
+        if tok.rsplit('/', 1)[-1] in _INTERPRETERS:
+            return True
+    return bool(_CODE_MARKER_RE.search(marker))
+
+
+def _rejoin_split_tokens(text):
+    """Reúne identificadores/números partidos por el wrap del terminal.
+
+    Un wrap duro parte una línea larga en la columna del ancho del terminal,
+    a veces en mitad de un token: `...DISBURSED,LoanSta` + `\\n` + `tus.PAID_OFF`.
+    Esto rompe el código (NameError/SyntaxError) y no hay whitespace que lo
+    delate, así que se reconoce por:
+      - existe un *ancho de wrap* (longitud >=50 que comparten >=2 líneas:
+        la columna donde el terminal cortó varias líneas), y
+      - la línea cortada llega cerca de ese ancho, y
+      - el corte queda entre dos caracteres de palabra sin espacios, y
+      - la continuación no parece un statement nuevo (keyword o `x =`).
+    Solo entonces se unen sin separador. Exigir que el ancho lo compartan
+    >=2 líneas evita falsos positivos (una sola línea larga seguida de otra
+    no alcanza) y que una línea ya unida infle el umbral.
+    """
+    lines = text.split('\n')
+    if len(lines) < 2:
+        return text
+    lengths = [len(ln) for ln in lines]
+    shared = {L for L in lengths if L >= 50 and lengths.count(L) >= 2}
+    if not shared:
+        return text
+    thresh = max(50, int(max(shared) * 0.85))
+    out = [lines[0]]
+    for nxt in lines[1:]:
+        cur = out[-1]
+        if (len(cur) >= thresh and cur and nxt
+                and (cur[-1].isalnum() or cur[-1] == '_')
+                and (nxt[0].isalnum() or nxt[0] == '_')):
+            head = _WORD_HEAD_RE.match(nxt).group(0)
+            if head not in _PY_KEYWORDS and not _STMT_START_RE.match(nxt):
+                out[-1] = cur + nxt
+                continue
+        out.append(nxt)
+    return '\n'.join(out)
+
+
+def _heredoc_scan(text, start):
+    """Localiza un heredoc en `start` y devuelve sus límites.
+
+    Soporta `<<MARKER`, `<<-MARKER` (terminador con tabs líderes) y
+    `<<'MARKER'`/`<<"MARKER"`. Retorna dict con `marker`, `body_start`,
+    `body_end` (inicio de la línea del terminador) y `full_end` (fin de esa
+    línea), o None si no es heredoc.
     """
     n = len(text)
     j = start + 2
@@ -225,14 +298,16 @@ def _heredoc_end(text, start):
     nl = text.find('\n', j)
     if nl < 0:
         return None
-    pos = nl + 1
+    body_start = nl + 1
+    pos = body_start
     while pos <= n:
         next_nl = text.find('\n', pos)
         line_end = next_nl if next_nl >= 0 else n
         line = text[pos:line_end]
         check = line.lstrip('\t') if dash else line
         if check == marker:
-            return line_end
+            return {'marker': marker, 'body_start': body_start,
+                    'body_end': pos, 'full_end': line_end}
         if next_nl < 0:
             return None
         pos = next_nl + 1
@@ -275,14 +350,23 @@ def _join_continuations_and_wrap(text):
                 i += 1
                 continue
 
-        # Heredoc shell (<<MARKER, <<-MARKER, <<'MARKER', <<"MARKER")
-        # Preserva el cuerpo verbatim hasta encontrar el terminador.
+        # Heredoc shell (<<MARKER, <<-MARKER, <<'MARKER', <<"MARKER").
+        # Si el cuerpo es código (python/node/...), se desenrolla recursivo
+        # para arreglar saltos dentro de strings; si es texto, se preserva
+        # verbatim hasta el terminador.
         if (state is None and c == '<' and i + 1 < n and text[i+1] == '<'
                 and not (i + 2 < n and text[i+2] == '<')):
-            end = _heredoc_end(text, i)
-            if end is not None:
-                out.append(text[i:end])
-                i = end
+            hd = _heredoc_scan(text, i)
+            if hd is not None:
+                prefix = ''.join(out)
+                prefix = prefix[prefix.rfind('\n') + 1:]
+                header = text[i:hd['body_start']]
+                body = text[hd['body_start']:hd['body_end']]
+                term = text[hd['body_end']:hd['full_end']]
+                if _heredoc_is_code(prefix, hd['marker']):
+                    body = _join_continuations_and_wrap(body)
+                out.append(header + body + term)
+                i = hd['full_end']
                 continue
 
         if state is None and i + 3 <= n and text[i:i+3] in ('"""', "'''"):
@@ -363,14 +447,21 @@ def fix_wrapped_code(text):
     4. Quita prefijos de número de línea (`  12 | ...`) si la mayoría de
        las líneas con texto los tienen.
     5. Trim de whitespace al final de cada línea.
-    6. Resuelve continuaciones `\\<nl>` (incluso con espacios artefacto del
+    6. Reúne identificadores partidos a la mitad por el wrap del terminal
+       (`LoanSta`+`tus` → `LoanStatus`), antes de tocar strings para no meter
+       un espacio espurio (`f alse`); solo en el ancho de wrap detectado y
+       cuando la continuación no parece un statement nuevo.
+    7. Resuelve continuaciones `\\<nl>` (incluso con espacios artefacto del
        wrap del terminal) y newlines insertados por wrap dentro de strings.
+       El cuerpo de heredocs de intérprete (`python - <<'EOF'`, `node <<EOF`)
+       se desenrolla recursivamente; los heredocs de texto quedan verbatim.
     """
     text = _normalize_invisible(text)
     text = _normalize_quotes(text)
     text = _strip_shell_prompts(text)
     text = _strip_line_numbers(text)
     text = _trim_trailing_ws(text)
+    text = _rejoin_split_tokens(text)
     text = _join_continuations_and_wrap(text)
     return text
 
